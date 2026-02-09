@@ -3,7 +3,9 @@ import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockState;
 import org.bukkit.block.Chest;
+import org.bukkit.block.DoubleChest;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.ConfigurationSection;
@@ -17,8 +19,10 @@ import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.inventory.InventoryOpenEvent;
 import org.bukkit.inventory.DoubleChestInventory;
+import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.loot.LootTable;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
@@ -67,36 +71,8 @@ public class ChestLock2 extends JavaPlugin implements Listener {
 
 
 
-    @EventHandler
-    public void onChestBreak(BlockBreakEvent event) {
-        Block block = event.getBlock();
 
-        if (block.getType() != Material.CHEST && block.getType() != Material.TRAPPED_CHEST) return;
 
-        String key = locKey(block);
-        String owner = chestOwners.get(key);
-
-        String world = block.getWorld().getName();
-        int x = block.getX();
-        int y = block.getY();
-        int z = block.getZ();
-
-        String ownerText = (owner != null) ? owner : "GLOBAL";
-
-        String message = ChatColor.YELLOW + "[ChestBreak] "
-                + ChatColor.WHITE + "World: " + ChatColor.AQUA + world
-                + ChatColor.WHITE + " | XYZ: "
-                + ChatColor.AQUA + x + ", " + y + ", " + z
-                + ChatColor.WHITE + " | Owner: "
-                + ChatColor.RED + ownerText;
-
-        // Send only to OPs
-        for (Player p : Bukkit.getOnlinePlayers()) {
-            if (p.isOp()) {
-                p.sendMessage(message);
-            }
-        }
-    }
 
 
     @EventHandler
@@ -281,7 +257,7 @@ public class ChestLock2 extends JavaPlugin implements Listener {
         InventoryHolder holder = event.getInventory().getHolder();
 
         // ✅ Correct double chest detection
-        if (holder instanceof org.bukkit.block.DoubleChest doubleChest) {
+        if (holder instanceof DoubleChest doubleChest) {
 
             Chest left = (Chest) doubleChest.getLeftSide();
             Chest right = (Chest) doubleChest.getRightSide();
@@ -369,8 +345,125 @@ public class ChestLock2 extends JavaPlugin implements Listener {
         }
     }
 
+
+    @EventHandler
+    public void onChestBreak(BlockBreakEvent event) {
+        if (!(event.getBlock().getState() instanceof Chest chest) || event.getBlock().getType() != Material.CHEST) return;
+        String playerBreakName = event.getPlayer().getName();
+        Block block = chest.getBlock();
+        World world = block.getWorld();
+
+
+
+        // 📦 Capture FULL inventory (single + double chest)
+        ItemStack[] original = chest.getInventory().getContents();
+        ItemStack[] contents = new ItemStack[original.length];
+
+        for (int i = 0; i < original.length; i++) {
+            if (original[i] != null) {
+                contents[i] = original[i].clone(); // 🔥 deep clone
+            }
+        }
+
+        // 🧠 Save restore data
+        BrokenChestData data = new BrokenChestData();
+        data.world = world.getName();
+        data.x = block.getX();
+        data.y = block.getY();
+        data.z = block.getZ();
+        data.type = block.getType();
+        data.contents = contents;
+        data.owner = chestOwners.get(locKey(block));
+        UUID restoreId = UUID.randomUUID();
+        brokenChests.put(restoreId, data);
+
+        sendRestoreClickableToOps(data, restoreId, playerBreakName);
+    }
+
+
+
+    private void sendRestoreClickableToOps(BrokenChestData data, UUID id, String name) {
+        TextComponent base = new TextComponent(
+                ChatColor.YELLOW + "[ChestBreak] "
+                        + ChatColor.WHITE + data.world + " "
+                        + ChatColor.AQUA + data.x + "," + data.y + "," + data.z
+                        + ChatColor.WHITE +" Broke the chest: "
+                        + ChatColor.DARK_PURPLE + " "+ name
+                        + ChatColor.WHITE + " Owner: "
+                        + ChatColor.RED + (data.owner != null ? data.owner : "GLOBAL") + " "
+        );
+
+        TextComponent restore = new TextComponent(ChatColor.GREEN + "[RESTORE]");
+        restore.setBold(true);
+        restore.setClickEvent(new ClickEvent(
+                ClickEvent.Action.RUN_COMMAND,
+                "/__restore_internal " + id
+        ));
+        restore.setHoverEvent(new HoverEvent(
+                HoverEvent.Action.SHOW_TEXT,
+                new ComponentBuilder("Click to restore this chest").create()
+        ));
+
+        base.addExtra(restore);
+
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            if (p.isOp()) {
+                p.spigot().sendMessage(base);
+            }
+        }
+    }
+
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (command.getName().equalsIgnoreCase("__restore_internal")) {
+            if (!(sender instanceof Player p)) return true;
+            if (!p.isOp()) return true;
+
+
+            UUID id;
+            try {
+                id = UUID.fromString(args[0]);
+            } catch (Exception e) {
+                return true;
+            }
+
+            BrokenChestData data = brokenChests.remove(id);
+
+            if (data == null) {
+                p.sendMessage(ChatColor.RED + "Restore expired or already used.");
+                return true;
+            }
+
+            World world = Bukkit.getWorld(data.world);
+            if (world == null) return true;
+
+            Block block = world.getBlockAt(data.x, data.y, data.z);
+            if (!block.getType().isAir()) {
+                p.sendMessage(ChatColor.RED + "Cannot restore: block is not empty.");
+                return true;
+            }
+
+            block.setType(Material.CHEST, false);
+            Chest c = (Chest) block.getState();
+
+
+            Inventory inv = c.getInventory();
+            for(ItemStack item : data.contents){
+                if (item != null){
+                inv.addItem((ItemStack) item.clone());
+                }
+            }
+
+
+            if (data.owner != null) {
+                chestOwners.put(locKey(block), data.owner);
+                saveOwners();
+            }
+
+            p.sendMessage(ChatColor.GREEN + "Chest restored successfully.");
+            return true;
+        }
+
         if (command.getName().equalsIgnoreCase("claim")) {
             if (!(sender instanceof Player p)) return false;
 
@@ -432,6 +525,29 @@ public class ChestLock2 extends JavaPlugin implements Listener {
 
 
             p.sendMessage(ChatColor.GREEN + "התיבה עכשיו גלובלית.");
+            return true;
+        }
+
+        if (command.getName().equalsIgnoreCase("who")) {
+            if (!(sender instanceof Player p)) return false;
+
+            if (!p.isOp()) {
+                p.sendMessage(ChatColor.RED + "אין לך גישה לפקודה הזאת.");
+                return false;
+            }
+
+            Block targetBlock = p.getTargetBlock(Set.of(Material.AIR), 10);
+
+            if (targetBlock.getType() != Material.CHEST && targetBlock.getType() != Material.TRAPPED_CHEST) {
+                p.sendMessage(ChatColor.RED + "אתה לא מסתכל על תיבה.");
+                return true;
+            }
+
+            String key = locKey(targetBlock);
+
+            String owner = chestOwners.get(key);
+
+            p.sendMessage(ChatColor.GREEN + "התיבה שייכת ל- " + owner);
             return true;
         }
 
