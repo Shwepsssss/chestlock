@@ -46,6 +46,8 @@ public class ChestLock2 extends JavaPlugin implements Listener {
         Material type;
         ItemStack[] contents;
         String owner;
+        boolean wasDoubleChest;
+        String side; // "left" or "right" - which side was broken
     }
 
     private final Map<UUID, BrokenChestData> brokenChests = new HashMap<>();
@@ -353,15 +355,57 @@ public class ChestLock2 extends JavaPlugin implements Listener {
         Block block = chest.getBlock();
         World world = block.getWorld();
 
+        // 🔍 Check if this chest is part of a double chest
+        Inventory chestInventory = chest.getInventory();
+        boolean isDoubleChest = chestInventory instanceof DoubleChestInventory;
+        String whichSide = null;
+        ItemStack[] contents;
 
+        if (isDoubleChest) {
+            DoubleChestInventory doubleInv = (DoubleChestInventory) chestInventory;
+            DoubleChest doubleChest = (DoubleChest) doubleInv.getHolder();
 
-        // 📦 Capture FULL inventory (single + double chest)
-        ItemStack[] original = chest.getInventory().getContents();
-        ItemStack[] contents = new ItemStack[original.length];
+            Chest leftChest = (Chest) doubleChest.getLeftSide();
+            Chest rightChest = (Chest) doubleChest.getRightSide();
 
-        for (int i = 0; i < original.length; i++) {
-            if (original[i] != null) {
-                contents[i] = original[i].clone(); // 🔥 deep clone
+            // Determine which side was broken
+            if (leftChest.getBlock().equals(block)) {
+                whichSide = "left";
+                // Capture only left side (slots 0-26)
+                contents = new ItemStack[27];
+                ItemStack[] fullInv = doubleInv.getContents();
+                for (int i = 0; i < 27; i++) {
+                    if (fullInv[i] != null) {
+                        contents[i] = fullInv[i].clone();
+                    }
+                }
+            } else {
+                whichSide = "right";
+                // Capture only right side (slots 27-53)
+                contents = new ItemStack[27];
+                ItemStack[] fullInv = doubleInv.getContents();
+                for (int i = 0; i < 27; i++) {
+                    if (fullInv[i + 27] != null) {
+                        contents[i] = fullInv[i + 27].clone();
+                    }
+                }
+            }
+
+            // Debug log
+            int itemCount = 0;
+            for (ItemStack item : contents) {
+                if (item != null) itemCount++;
+            }
+            getLogger().info("Double chest broken - Side: " + whichSide + ", Items captured: " + itemCount);
+
+        } else {
+            // Single chest - capture all contents
+            ItemStack[] original = chest.getInventory().getContents();
+            contents = new ItemStack[original.length];
+            for (int i = 0; i < original.length; i++) {
+                if (original[i] != null) {
+                    contents[i] = original[i].clone();
+                }
             }
         }
 
@@ -374,6 +418,9 @@ public class ChestLock2 extends JavaPlugin implements Listener {
         data.type = block.getType();
         data.contents = contents;
         data.owner = chestOwners.get(locKey(block));
+        data.wasDoubleChest = isDoubleChest;
+        data.side = whichSide;
+
         UUID restoreId = UUID.randomUUID();
         brokenChests.put(restoreId, data);
 
@@ -383,12 +430,15 @@ public class ChestLock2 extends JavaPlugin implements Listener {
 
 
     private void sendRestoreClickableToOps(BrokenChestData data, UUID id, String name) {
+        String chestType = data.wasDoubleChest ? "(" + data.side + " side of double chest)" : "(single chest)";
+
         TextComponent base = new TextComponent(
                 ChatColor.YELLOW + "[ChestBreak] "
                         + ChatColor.WHITE + data.world + " "
-                        + ChatColor.AQUA + data.x + "," + data.y + "," + data.z
-                        + ChatColor.WHITE +" Broke the chest: "
-                        + ChatColor.DARK_PURPLE + " "+ name
+                        + ChatColor.AQUA + data.x + "," + data.y + "," + data.z + " "
+                        + ChatColor.GRAY + chestType
+                        + ChatColor.WHITE + " Broke the chest: "
+                        + ChatColor.DARK_PURPLE + " " + name
                         + ChatColor.WHITE + " Owner: "
                         + ChatColor.RED + (data.owner != null ? data.owner : "GLOBAL") + " "
         );
@@ -438,30 +488,151 @@ public class ChestLock2 extends JavaPlugin implements Listener {
             if (world == null) return true;
 
             Block block = world.getBlockAt(data.x, data.y, data.z);
+
+            // Check if block location is empty
             if (!block.getType().isAir()) {
                 p.sendMessage(ChatColor.RED + "Cannot restore: block is not empty.");
                 return true;
             }
 
+            // Debug log
+            int savedItems = 0;
+            for (ItemStack item : data.contents) {
+                if (item != null) savedItems++;
+            }
+            getLogger().info("Restoring chest - Was double: " + data.wasDoubleChest + ", Side: " + data.side + ", Items to restore: " + savedItems);
+
+            // Place the chest block first
             block.setType(Material.CHEST, false);
-            Chest c = (Chest) block.getState();
 
+            // Check if restoring to a double chest situation
+            if (data.wasDoubleChest) {
+                Block connectedChest = getConnectedChest(block);
 
-            Inventory inv = c.getInventory();
-            for(ItemStack item : data.contents){
-                if (item != null){
-                inv.addItem((ItemStack) item.clone());
+                if (connectedChest != null && connectedChest.getType() == Material.CHEST) {
+                    // There's still a chest connected - restore as part of double chest
+                    // We need to force update both blocks
+                    Bukkit.getScheduler().runTaskLater(this, () -> {
+                        // Force block update
+                        block.getState().update(true, false);
+                        connectedChest.getState().update(true, false);
+
+                        // Wait another tick for the update to propagate
+                        Bukkit.getScheduler().runTaskLater(this, () -> {
+                            // Try to get double chest inventory from the connected chest
+                            Chest connectedChestState = (Chest) connectedChest.getState();
+                            Inventory connectedInv = connectedChestState.getInventory();
+
+                            // Also try from the newly placed chest
+                            Chest newChestState = (Chest) block.getState();
+                            Inventory newInv = newChestState.getInventory();
+
+                            getLogger().info("Connected chest inventory: " + connectedInv.getClass().getSimpleName() + ", Size: " + connectedInv.getSize());
+                            getLogger().info("New chest inventory: " + newInv.getClass().getSimpleName() + ", Size: " + newInv.getSize());
+
+                            Inventory doubleInv = null;
+
+                            // Try to find the double chest inventory
+                            if (connectedInv instanceof DoubleChestInventory) {
+                                doubleInv = connectedInv;
+                            } else if (newInv instanceof DoubleChestInventory) {
+                                doubleInv = newInv;
+                            }
+
+                            if (doubleInv != null && doubleInv instanceof DoubleChestInventory) {
+                                DoubleChestInventory dci = (DoubleChestInventory) doubleInv;
+                                DoubleChest dc = (DoubleChest) dci.getHolder();
+
+                                Chest leftChest = (Chest) dc.getLeftSide();
+                                Chest rightChest = (Chest) dc.getRightSide();
+
+                                // Determine which side to restore to
+                                boolean restoringToLeft = leftChest.getBlock().equals(block);
+                                int startSlot = restoringToLeft ? 0 : 27;
+
+                                getLogger().info("Restoring to " + (restoringToLeft ? "left" : "right") + " side, starting at slot " + startSlot);
+
+                                // Place items in the correct slots
+                                int restoredCount = 0;
+                                for (int i = 0; i < data.contents.length && i < 27; i++) {
+                                    if (data.contents[i] != null) {
+                                        dci.setItem(startSlot + i, data.contents[i].clone());
+                                        restoredCount++;
+                                    }
+                                }
+
+                                getLogger().info("Restored " + restoredCount + " items to double chest");
+
+                                p.sendMessage(ChatColor.GREEN + "Chest restored successfully as " +
+                                        (restoringToLeft ? "left" : "right") + " side of double chest (was originally " + data.side + " side). Items restored: " + restoredCount);
+                            } else {
+                                getLogger().warning("Double chest still did not form after updates!");
+
+                                // Fallback: Just place items directly in the single chest inventory
+                                Chest c = (Chest) block.getState();
+                                Inventory inv = c.getInventory();
+
+                                int restoredCount = 0;
+                                for (ItemStack item : data.contents) {
+                                    if (item != null) {
+                                        inv.addItem(item.clone());
+                                        restoredCount++;
+                                    }
+                                }
+
+                                p.sendMessage(ChatColor.GREEN + "Chest restored as single inventory (double chest did not form). Items restored: " + restoredCount);
+                            }
+
+                            if (data.owner != null) {
+                                chestOwners.put(locKey(block), data.owner);
+                                saveOwners();
+                            }
+                        }, 2L); // Wait 2 more ticks
+                    }, 2L); // Initial wait of 2 ticks
+
+                    return true;
+                } else {
+                    // No connected chest - restore as single chest
+                    Chest c = (Chest) block.getState();
+                    Inventory inv = c.getInventory();
+
+                    int restoredCount = 0;
+                    for (ItemStack item : data.contents) {
+                        if (item != null) {
+                            inv.addItem(item.clone());
+                            restoredCount++;
+                        }
+                    }
+
+                    if (data.owner != null) {
+                        chestOwners.put(locKey(block), data.owner);
+                        saveOwners();
+                    }
+
+                    p.sendMessage(ChatColor.GREEN + "Chest restored successfully (originally " + data.side + " side, now single chest). Items restored: " + restoredCount);
+                    return true;
                 }
+            } else {
+                // Was originally a single chest
+                Chest c = (Chest) block.getState();
+                Inventory inv = c.getInventory();
+
+                int restoredCount = 0;
+                for (ItemStack item : data.contents) {
+                    if (item != null) {
+                        inv.addItem(item.clone());
+                        restoredCount++;
+                    }
+                }
+
+                if (data.owner != null) {
+                    chestOwners.put(locKey(block), data.owner);
+                    saveOwners();
+                }
+
+                p.sendMessage(ChatColor.GREEN + "Chest restored successfully. Items restored: " + restoredCount);
+                return true;
             }
-
-
-            if (data.owner != null) {
-                chestOwners.put(locKey(block), data.owner);
-                saveOwners();
-            }
-
-            p.sendMessage(ChatColor.GREEN + "Chest restored successfully.");
-            return true;
         }
 
         if (command.getName().equalsIgnoreCase("claim")) {
@@ -572,6 +743,6 @@ public class ChestLock2 extends JavaPlugin implements Listener {
             sender.sendMessage("§dRegeneration III enabled for 30 minutes.");
 
         }
-            return false;
+        return false;
     }
 }
