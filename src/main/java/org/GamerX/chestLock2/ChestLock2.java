@@ -502,97 +502,124 @@ public class ChestLock2 extends JavaPlugin implements Listener {
             }
             getLogger().info("Restoring chest - Was double: " + data.wasDoubleChest + ", Side: " + data.side + ", Items to restore: " + savedItems);
 
-            // Place the chest block first
-            block.setType(Material.CHEST, false);
+            // Check if block location is empty
+            if (!block.getType().isAir()) {
+                p.sendMessage(ChatColor.RED + "Cannot restore: block is not empty.");
+                return true;
+            }
+
+
+            getLogger().info("Restoring chest - Was double: " + data.wasDoubleChest + ", Side: " + data.side + ", Items to restore: " + savedItems);
 
             // Check if restoring to a double chest situation
             if (data.wasDoubleChest) {
                 Block connectedChest = getConnectedChest(block);
 
                 if (connectedChest != null && connectedChest.getType() == Material.CHEST) {
-                    // There's still a chest connected - restore as part of double chest
-                    // We need to force update both blocks
+                    // There's still a chest connected - we need to properly set BlockData to form double chest
+
+                    // Get the connected chest's BlockData
+                    org.bukkit.block.data.type.Chest connectedChestData =
+                            (org.bukkit.block.data.type.Chest) connectedChest.getBlockData();
+
+                    // Place the new chest block
+                    block.setType(Material.CHEST, false);
+
+                    // Get the new chest's BlockData
+                    org.bukkit.block.data.type.Chest newChestData =
+                            (org.bukkit.block.data.type.Chest) block.getBlockData();
+
+                    // Set both chests to have the same facing direction
+                    newChestData.setFacing(connectedChestData.getFacing());
+
+                    // Determine which chest is on which side based on their relative positions
+                    int dx = block.getX() - connectedChest.getX();
+                    int dz = block.getZ() - connectedChest.getZ();
+
+                    org.bukkit.block.BlockFace facing = connectedChestData.getFacing();
+
+                    // Determine left/right based on facing direction and relative position
+                    org.bukkit.block.data.type.Chest.Type newChestType;
+                    org.bukkit.block.data.type.Chest.Type connectedChestType;
+
+                    if (facing == org.bukkit.block.BlockFace.NORTH) {
+                        // Facing north: left is east (+x)
+                        if (dx > 0) {
+                            newChestType = org.bukkit.block.data.type.Chest.Type.RIGHT;
+                            connectedChestType = org.bukkit.block.data.type.Chest.Type.LEFT;
+                        } else {
+                            newChestType = org.bukkit.block.data.type.Chest.Type.LEFT;
+                            connectedChestType = org.bukkit.block.data.type.Chest.Type.RIGHT;
+                        }
+                    } else if (facing == org.bukkit.block.BlockFace.SOUTH) {
+                        // Facing south: left is west (-x)
+                        if (dx < 0) {
+                            newChestType = org.bukkit.block.data.type.Chest.Type.RIGHT;
+                            connectedChestType = org.bukkit.block.data.type.Chest.Type.LEFT;
+                        } else {
+                            newChestType = org.bukkit.block.data.type.Chest.Type.LEFT;
+                            connectedChestType = org.bukkit.block.data.type.Chest.Type.RIGHT;
+                        }
+                    } else if (facing == org.bukkit.block.BlockFace.WEST) {
+                        // Facing west: left is south (+z)
+                        if (dz > 0) {
+                            newChestType = org.bukkit.block.data.type.Chest.Type.LEFT;
+                            connectedChestType = org.bukkit.block.data.type.Chest.Type.RIGHT;
+                        } else {
+                            newChestType = org.bukkit.block.data.type.Chest.Type.RIGHT;
+                            connectedChestType = org.bukkit.block.data.type.Chest.Type.LEFT;
+                        }
+                    } else { // EAST
+                        // Facing east: left is north (-z)
+                        if (dz < 0) {
+                            newChestType = org.bukkit.block.data.type.Chest.Type.LEFT;
+                            connectedChestType = org.bukkit.block.data.type.Chest.Type.RIGHT;
+                        } else {
+                            newChestType = org.bukkit.block.data.type.Chest.Type.RIGHT;
+                            connectedChestType = org.bukkit.block.data.type.Chest.Type.LEFT;
+                        }
+                    }
+
+                    // Set the chest types
+                    newChestData.setType(newChestType);
+                    connectedChestData.setType(connectedChestType);
+
+                    // Apply the BlockData changes
+                    block.setBlockData(newChestData, true);
+                    connectedChest.setBlockData(connectedChestData, true);
+
+                    getLogger().info("Set chest types - New: " + newChestType + ", Connected: " + connectedChestType + ", Facing: " + facing);
+
+                    // Wait for the double chest to form
                     Bukkit.getScheduler().runTaskLater(this, () -> {
-                        // Force block update
-                        block.getState().update(true, false);
-                        connectedChest.getState().update(true, false);
+                        Chest c = (Chest) block.getState();
+                        Inventory inv = c.getInventory();
 
-                        // Wait another tick for the update to propagate
-                        Bukkit.getScheduler().runTaskLater(this, () -> {
-                            // Try to get double chest inventory from the connected chest
-                            Chest connectedChestState = (Chest) connectedChest.getState();
-                            Inventory connectedInv = connectedChestState.getInventory();
+                        getLogger().info("After forming - Inventory type: " + inv.getClass().getSimpleName() + ", Size: " + inv.getSize());
 
-                            // Also try from the newly placed chest
-                            Chest newChestState = (Chest) block.getState();
-                            Inventory newInv = newChestState.getInventory();
-
-                            getLogger().info("Connected chest inventory: " + connectedInv.getClass().getSimpleName() + ", Size: " + connectedInv.getSize());
-                            getLogger().info("New chest inventory: " + newInv.getClass().getSimpleName() + ", Size: " + newInv.getSize());
-
-                            Inventory doubleInv = null;
-
-                            // Try to find the double chest inventory
-                            if (connectedInv instanceof DoubleChestInventory) {
-                                doubleInv = connectedInv;
-                            } else if (newInv instanceof DoubleChestInventory) {
-                                doubleInv = newInv;
+                        // Place items
+                        int restoredCount = 0;
+                        for (ItemStack item : data.contents) {
+                            if (item != null) {
+                                inv.addItem(item.clone());
+                                restoredCount++;
                             }
+                        }
 
-                            if (doubleInv != null && doubleInv instanceof DoubleChestInventory) {
-                                DoubleChestInventory dci = (DoubleChestInventory) doubleInv;
-                                DoubleChest dc = (DoubleChest) dci.getHolder();
+                        if (data.owner != null) {
+                            chestOwners.put(locKey(block), data.owner);
+                            saveOwners();
+                        }
 
-                                Chest leftChest = (Chest) dc.getLeftSide();
-                                Chest rightChest = (Chest) dc.getRightSide();
-
-                                // Determine which side to restore to
-                                boolean restoringToLeft = leftChest.getBlock().equals(block);
-                                int startSlot = restoringToLeft ? 0 : 27;
-
-                                getLogger().info("Restoring to " + (restoringToLeft ? "left" : "right") + " side, starting at slot " + startSlot);
-
-                                // Place items in the correct slots
-                                int restoredCount = 0;
-                                for (int i = 0; i < data.contents.length && i < 27; i++) {
-                                    if (data.contents[i] != null) {
-                                        dci.setItem(startSlot + i, data.contents[i].clone());
-                                        restoredCount++;
-                                    }
-                                }
-
-                                getLogger().info("Restored " + restoredCount + " items to double chest");
-
-                                p.sendMessage(ChatColor.GREEN + "Chest restored successfully as " +
-                                        (restoringToLeft ? "left" : "right") + " side of double chest (was originally " + data.side + " side). Items restored: " + restoredCount);
-                            } else {
-                                getLogger().warning("Double chest still did not form after updates!");
-
-                                // Fallback: Just place items directly in the single chest inventory
-                                Chest c = (Chest) block.getState();
-                                Inventory inv = c.getInventory();
-
-                                int restoredCount = 0;
-                                for (ItemStack item : data.contents) {
-                                    if (item != null) {
-                                        inv.addItem(item.clone());
-                                        restoredCount++;
-                                    }
-                                }
-
-                                p.sendMessage(ChatColor.GREEN + "Chest restored as single inventory (double chest did not form). Items restored: " + restoredCount);
-                            }
-
-                            if (data.owner != null) {
-                                chestOwners.put(locKey(block), data.owner);
-                                saveOwners();
-                            }
-                        }, 2L); // Wait 2 more ticks
-                    }, 2L); // Initial wait of 2 ticks
+                        String chestType = inv.getSize() == 54 ? "double chest" : "single chest (connection failed)";
+                        p.sendMessage(ChatColor.GREEN + "Chest restored successfully as " + chestType + ". Items restored: " + restoredCount);
+                    }, 3L);
 
                     return true;
                 } else {
                     // No connected chest - restore as single chest
+                    block.setType(Material.CHEST, true);
+
                     Chest c = (Chest) block.getState();
                     Inventory inv = c.getInventory();
 
@@ -614,6 +641,8 @@ public class ChestLock2 extends JavaPlugin implements Listener {
                 }
             } else {
                 // Was originally a single chest
+                block.setType(Material.CHEST, true);
+
                 Chest c = (Chest) block.getState();
                 Inventory inv = c.getInventory();
 
